@@ -1,9 +1,11 @@
 # AIS port congestion pipeline
 
 A real-time pipeline that tracks ships near major ports and measures how congested
-each port is. Live AIS ship positions stream through Kafka, Spark Structured Streaming
-turns them into Delta Lake tables (bronze → silver → gold), and a Streamlit dashboard
-shows the result on a map.
+each port is: how many ships are queueing, and how long they wait. Live AIS ship
+positions stream through Kafka, Spark Structured Streaming turns them into Delta Lake
+tables (bronze → silver → gold), and a Streamlit dashboard shows the result on a map.
+
+![Dashboard with live data: over 16,000 ships tracked, 314 waiting across 10 ports](docs/dashboard.png)
 
 ## Why
 
@@ -24,18 +26,22 @@ aisstream.io / simulator ──► producer ──► Kafka (ais.raw, keyed by M
                            └─► silver/ship_positions   parsed, validated, deduplicated, with activity
                                               │
                          spark-congestion ◄───┘
-                           └─► gold/port_congestion    waiting / berthed / moving ships, per port per window
+                           ├─► gold/port_congestion    waiting / berthed / moving ships, per port per window
+                           ├─► gold/ship_waits         one row per finished wait (dwell time)
+                           └─► gold/current_waits      ships waiting right now, and since when
                                               │
-                         dashboard ◄──────────┘        Streamlit: leaderboard, trends, live map
+                         dashboard ◄──────────┘        Streamlit: leaderboard, trends, wait times, live map
 ```
 
 | Path | What it does |
 |---|---|
 | `producer/producer.py` | Streams AIS position reports into Kafka, from aisstream.io (`live`) or a built-in ship simulator (`mock`) |
 | `spark/stream_positions.py` | Kafka → bronze (raw) and silver (clean) Delta tables |
-| `spark/port_congestion.py` | silver → gold: matches ships to ports and counts them per window |
-| `spark/show_tables.py` | Prints row counts and the latest congestion window |
+| `spark/port_congestion.py` | silver → gold: congestion per window, and per-ship wait tracking |
+| `spark/wait_tracker.py` | The dwell-time rules, in plain Python so they can be tested without Spark |
+| `spark/show_tables.py` | Prints row counts, a duplicate check, the latest window and the longest waits |
 | `spark/submit.sh` | Shared `spark-submit` with the Kafka and Delta packages |
+| `spark/Dockerfile` | The official Spark image plus pandas and pyarrow |
 | `dashboard/app.py` | Streamlit dashboard; reads the Delta tables directly, no Spark needed |
 | `config/ports.json` | The ports being watched and the radius of each port area |
 | `docker-compose.yml` | Kafka (KRaft), Kafka UI, producer, both Spark jobs and the dashboard |
@@ -81,6 +87,25 @@ messages before a window is written, so gold runs about 6–7 minutes behind rea
 port's radius, measured as great-circle distance. The port list is tiny, so it's
 broadcast to every executor instead of shuffled.
 
+**Dwell time with stateful streaming.** A count of waiting ships says how long the queue
+is; dwell time says how slowly it moves. A wait starts at a ship's first waiting report
+inside a port area and ends when it berths there (`berthed`), or when it has been moving
+or outside the area for more than 30 minutes (`departed`). Coming back to waiting within
+those 30 minutes continues the same wait, because ships reposition inside anchorages.
+Two hours with no reports closes the wait as `signal_lost`. Waits under 30 minutes are
+dropped, since those are usually pilot pickups rather than queueing.
+
+Spark keeps each ship's open wait in its state store between batches
+(`applyInPandasWithState`), and an event-time timeout closes waits that go silent. The
+rules live in `wait_tracker.py` as plain Python, so they're tested on their own. Finished
+waits are appended idempotently (Delta `txnAppId`/`txnVersion`), and open waits are
+upserted into `current_waits` with `MERGE`, so a batch that's rerun after a crash
+doesn't duplicate anything.
+
+**Tuning Delta for small tables.** Delta rebuilds a table's state from its log with 50
+tasks by default, which showed up in the Spark UI as the biggest jobs despite the log
+being tiny. `snapshotPartitions=4` brings that in line with the data size.
+
 ## Known limitations
 
 - A ship tied up at a berth whose crew left the status as "under way" is counted as
@@ -92,6 +117,12 @@ broadcast to every executor instead of shuffled.
 - The first window after a start only has partial data, so its counts are low.
 - A count of waiting ships isn't "congestion" until it's compared with that port's
   normal level, which needs a few weeks of history.
+- A ship that was already waiting when tracking started gets the time it was first
+  seen as its start, so its wait is underestimated.
+- A ship that takes more than 30 minutes to get from the anchorage to its berth is
+  recorded as `departed` rather than `berthed`.
+- Mock ships drop and weigh anchor at random, so dwell times only mean something with
+  live data.
 
 ## Running it
 
@@ -112,9 +143,11 @@ docker compose up -d --build
 whole world is too much for the machine. Delete `data/` (with the stack stopped) when
 switching from mock to live, so simulated ships don't mix with real ones.
 
-The first start downloads the Spark packages, so the Spark jobs take a minute or two to
-begin. The dashboard map fills in within a few minutes; the charts appear once the first
-window is written, about 25 minutes after the first start.
+The first start builds the Spark image and downloads the Spark packages, so the Spark
+jobs take a few minutes to begin. The dashboard map fills in within a few minutes; the
+congestion charts appear once the first window is written, about 25 minutes after the
+first start. Wait times take longer: a wait only counts after 30 minutes, and real ships
+often wait for hours.
 
 | What | Where |
 |---|---|
@@ -129,16 +162,27 @@ To print the tables from the terminal:
 docker compose exec spark-congestion bash /opt/jobs/submit.sh /opt/jobs/show_tables.py
 ```
 
-To stop everything (the lake in `data/` is kept):
+To stop everything (the lake in `data/` and the Kafka topic are kept):
 
 ```bash
 docker compose down
 ```
 
+For a completely clean start, remove the Kafka volume and the lake together. They have
+to go together: Spark's checkpoints remember Kafka offsets, so a fresh topic with old
+checkpoints leaves Spark pointing past the end of the data.
+
+```bash
+docker compose down -v && rm -rf data
+```
+
+The same applies when a table's columns change: Delta refuses writes that don't match
+the existing table, so the old tables and checkpoints need to go.
+
 `CONGESTION_WINDOW` and `CONGESTION_WATERMARK` in `.env` control the window size and
 late-data allowance. Changing them after gold has been written means deleting
-`data/lake/gold` and `data/checkpoints/gold_port_congestion` first, because the
-checkpoint remembers the old window size.
+`data/lake/gold` and `data/checkpoints/gold_*` first, because the checkpoints remember
+the old settings.
 
 ## Roadmap
 
@@ -146,7 +190,7 @@ checkpoint remembers the old window size.
 - [x] Bronze/silver/gold Delta tables with Spark Structured Streaming
 - [x] Waiting / berthed / moving classification, one state per ship per window
 - [x] Streamlit dashboard with a live map
-- [ ] Dwell time: how long each ship waits at a port, using stateful streaming
+- [x] Dwell time: how long each ship waits at a port, using stateful streaming
 - [ ] Alerts for ships that go silent ("AIS dark"), published to an `ais.alerts` topic
 - [ ] Compare each port with its own normal level to flag real congestion
 - [ ] Deploy to the cloud (Kafka on Confluent Cloud or MSK, Spark on Databricks or EMR, lake on S3) with Terraform
