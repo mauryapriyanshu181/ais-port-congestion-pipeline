@@ -1,0 +1,12 @@
+[
+  {"name": "Singapore", "country": "SG", "lat": 1.2640, "lon": 103.8400, "radius_km": 25},
+  {"name": "Shanghai (Yangshan)", "country": "CN", "lat": 30.6300, "lon": 122.0600, "radius_km": 25},
+  {"name": "Busan", "country": "KR", "lat": 35.1000, "lon": 129.0400, "radius_km": 15},
+  {"name": "Rotterdam", "country": "NL", "lat": 51.9500, "lon": 4.0500, "radius_km": 20},
+  {"name": "Hamburg", "country": "DE", "lat": 53.5400, "lon": 9.9700, "radius_km": 15},
+  {"name": "Los Angeles / Long Beach", "country": "US", "lat": 33.7400, "lon": -118.2400, "radius_km": 20},
+  {"name": "Jebel Ali", "country": "AE", "lat": 25.0100, "lon": 55.0600, "radius_km": 15},
+  {"name": "Nhava Sheva (JNPT)", "country": "IN", "lat": 18.9500, "lon": 72.9500, "radius_km": 15},
+  {"name": "Mundra", "country": "IN", "lat": 22.7400, "lon": 69.7000, "radius_km": 15},
+  {"name": "Santos", "country": "BR", "lat": -23.9800, "lon": -46.3000, "radius_km": 15}
+]
